@@ -27,6 +27,13 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+float s_angle=0;
+
 #define T 0.005
 #define taud 0.015
 float e_m1;
@@ -40,21 +47,21 @@ float omega_M1 = 0.0000;
 float omega_M2 = 0.0000;
 float omegaScale_M1 = 0.0000;
 float omegaScale_M2 = 0.0000;
-float ki_M1 =16;//0.25;//for tuning
+float ki_M1 = 16;//0.25;//for tuning
 float kp_M1 =1;//16;//for tuning
 float kd_M1 =0;
-float kp_pos=0.1;
-float ki_pos=0.005;
-float kd_pos=0;
 float yd_M1;
-float ki_M2 = 6;//for tuning
-float kp_M2 = 1.5;//for tuning
+float ki_M2 = 16;//for tuning
+float kp_M2 = 1;//for tuning
 float yd_M2;
 volatile int pulse=0;
 volatile int pulse_2=0;
-float kp_pos_2=1;
-float ki_pos_2=0.02;
-float kd_pos_2=0.005;
+float kp_pos=0.4;
+float ki_pos=0.5;
+float kd_pos=0.0007;
+float kp_pos_2=0.1;
+float ki_pos_2=0.0005;
+float kd_pos_2=0.00100;
 int volt_out_M1=0;
 int volt_out_M2=0;
 float integral_pos = 0;
@@ -65,17 +72,24 @@ float integral_pos_2 = 0;
 float integral_spd_2 = 0;
 float prev_e_pos_2 = 0;
 float prev_e_spd_2 = 0;
-float PULSES_PER_CM = 326.4508393;
+float angle=0;
+float target_angle=0;
+float pulses_per_degree=13.33333;
+//float PULSES_PER_CM = 295;
+float PULSES_PER_CM=11.0555;
 float target_dist_cm =0;
 float distance=0;
+float actual_angle=0;
 float cm=0;
-uint8_t cmd = 1;
-int n=0;
-/* USER CODE END PTD */
+int count=0;
+uint8_t rx_data;
+typedef enum {
+    MODE_IDLE,      // Target 0
+    MODE_LIFT,      // Target -20
+    MODE_SPIN,      // Target -270
+} ControlMode_t;
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
+ControlMode_t current_mode = MODE_IDLE;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -99,10 +113,10 @@ UART_HandleTypeDef huart1;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
-static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 void voltage_M1 (int volt_M1){
 	if (volt_M1 > 100){
@@ -130,21 +144,22 @@ void voltage_M2 (int volt_M2){
 	}
 	if (volt_M2>0){
 	TIM1->CCR4 = volt_M2;
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_13, 0);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_13, 1);
 	}else{
 	TIM1->CCR4 = -volt_M2;
-	HAL_GPIO_WritePin(GPIOE, GPIO_PIN_13, 1);
+	HAL_GPIO_WritePin(GPIOE, GPIO_PIN_13, 0);
 	}
 }
 void encoder(){
 	theta_M1 = TIM5-> CNT;
-	theta_M2 = (-1)*TIM2-> CNT;
+	theta_M2 = TIM2-> CNT;
 }
 void speedBackward(){
 	omega_M1 = (2.0/(T+2.0*taud))*(theta_M1-theta_M1_1)-((T-2.0*taud)/(T+2.0*taud))*omega_M1;
 	omega_M2 = (2.0/(T+2.0*taud))*(theta_M2-theta_M2_1)-((T-2.0*taud)/(T+2.0*taud))*omega_M2;
-	omegaScale_M1 = omega_M1/73;
+
 	omegaScale_M2 = omega_M2/71;
+	omegaScale_M1 = omega_M1/72;//kp_pos=0.5,ki_pos=0.003,Kd_pos=0.00001
 }
 float pid_control(float ref, float fb, float kp, float ki,float kd,float ofset, float *integralptr,float *prev_e_ptr,float output ){
 	    float error = ref-fb;
@@ -161,17 +176,79 @@ float pid_control(float ref, float fb, float kp, float ki,float kd,float ofset, 
 	    }
 	    return output;
 }
-void update_position_cm(float cm) {
-    target_dist_cm = cm;
-    pulse = target_dist_cm * PULSES_PER_CM;
-    distance=theta_M1/PULSES_PER_CM;
+void set_motor_angle(float angle) {
+    target_angle = angle;
+    pulse_2 = angle * pulses_per_degree;
+    actual_angle=theta_M2/pulses_per_degree;
 }
-void UART_SendRawInt(uint8_t val) {
-    // Send the 1-byte value (1, 2, or 3) via Interrupt mode
-    // We check if the UART is busy before sending to prevent crashing
+void UART_SendState(uint8_t state) {
+    // Only send if the UART is not currently busy transmitting
     if (huart1.gState == HAL_UART_STATE_READY) {
-        HAL_UART_Transmit_IT(&huart1, &val, 1);
+        HAL_UART_Transmit_IT(&huart1, &state, 1);
     }
+}
+
+//void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+//{
+//    if (huart->Instance == USART1)
+//    {
+//        /* * Logic: Use the received byte (rx_data) to set states.
+//         * You can send '0', '1', or '2' from your computer/controller.
+//         */
+//        switch(rx_data)
+//        {
+//        	case 0: // Mode IDLE
+//        		current_mode = MODE_IDLE;
+//        		pulse = 0;
+//        		set_motor_angle(0);
+//            break;
+//
+//            case 1: // Mode IDLE
+//                current_mode = MODE_IDLE;
+//                pulse = -1000;
+//                set_motor_angle(0);
+//                break;
+//
+//            case 2: // Mode LIFT
+//                current_mode = MODE_LIFT;
+//                pulse = 50;        // Example value for M1
+//                set_motor_angle(-90);
+//                break;
+//          case 3: // Mode LIFT
+//                current_mode = MODE_LIFT;
+//                pulse = 50;        // Example value for M1
+//                set_motor_angle(-70); // Example value for M2
+//                break;
+//            case 4: // Mode SPIN
+//                current_mode = MODE_SPIN;
+//                pulse = 50;       // Example value for M1
+//                set_motor_angle(180);// Example value for M2
+//                break;
+//            case 5: // Mode SPIN
+//                current_mode = MODE_SPIN;
+//                pulse = -1000;       // Example value for M1
+//                set_motor_angle(180);// Example value for M2
+//                break;
+//            default:
+//                // Handle other numbers as raw values if needed
+//                break;
+//        }
+//        UART_SendState(rx_data);
+//
+//        /* CRITICAL: Restart the interrupt to receive the next byte */
+//        count++ ;
+//        HAL_UART_Receive_IT(&huart1, &rx_data, 1);
+//    }
+//}
+void set_servo_angle(float s_angle) {
+    if (s_angle < 0) s_angle = 0;
+    if (s_angle > 270) s_angle = 270;
+
+    // Pulse range for DS3218: 500 (0 deg) to 2500 (270 deg)
+    uint32_t pulse_value = 500 + (uint32_t)((s_angle / 270.0f) * 2000.0f);
+
+    // Ensure this uses the calculated pulse_value
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, pulse_value);
 }
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -180,23 +257,26 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
      speedBackward();
      theta_M1_1 = theta_M1;
      theta_M2_1 = theta_M2;
-     update_position_cm(cm);//minus mean go up you STUPID!!!!
-     // Motor 1 Control Logic
-     yd_M1 = pid_control(pulse, theta_M1, kp_pos, ki_pos, kd_pos, 3.00, &integral_pos, &prev_e_pos, yd_M1);
-//     if (yd_M1 > 90)  { yd_M1 = 90; }
-//     if (yd_M1 < -90) { yd_M1 = -90; }
-     volt_out_M1 = pid_control(yd_M1, omegaScale_M1, kp_M1, ki_M1, 0, 0.00001, &integral_spd, &prev_e_spd, volt_out_M1);
 
-     // Motor 2 Control Logic (FIXED POINTERS AND OUTPUTS)
-     yd_M2 = pid_control(pulse_2, theta_M2, kp_pos_2, ki_pos_2, kd_pos_2, 3.00, &integral_pos_2, &prev_e_pos_2, yd_M2);
-     if (yd_M2 > 50)  { yd_M2 = 50; }
-     if (yd_M2 < -15) { yd_M2 = -15; }
+     // Update Motor 2 target based on current_mode angle
+     set_motor_angle(target_angle);//0 -90(down for grabing)
+
+     // Motor 1 Position/Speed Control
+//     yd_M1 = pid_control(pulse, theta_M1, kp_pos, ki_pos, kd_pos, 1.00, &integral_pos, &prev_e_pos, yd_M1);
+//     if (yd_M1 > 90)  yd_M1 = 90;
+//     if (yd_M1 < -90) yd_M1 = -90;
+//     volt_out_M1 = pid_control(yd_M1, omegaScale_M1, kp_M1, ki_M1, 0, 0.00001, &integral_spd, &prev_e_spd, volt_out_M1);
+
+     // Motor 2 Position/Speed Control (FIXED: Uses yd_M2 and Motor 2 pointers)
+     yd_M2 = pid_control(pulse_2, theta_M2, kp_pos_2, ki_pos_2, kd_pos_2, 1.00, &integral_pos_2, &prev_e_pos_2, yd_M2);
+     if (yd_M2 > 50)  yd_M2 = 50;
+     if (yd_M2 < -50) yd_M2 = -50;
      volt_out_M2 = pid_control(yd_M2, omegaScale_M2, kp_M2, ki_M2, 0, 0.00001, &integral_spd_2, &prev_e_spd_2, volt_out_M2);
 
-     // Write to Motors
-//     voltage_M2(volt_out_M2);
-     voltage_M1(volt_out_M1);
- }
+//     voltage_M1(volt_out_M1);
+ 	 set_servo_angle(s_angle);//0-90(close)
+     voltage_M2(volt_out_M2);
+    }
 }
 /* USER CODE END PFP */
 
@@ -235,21 +315,41 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_TIM1_Init();
-  MX_TIM2_Init();
   MX_TIM3_Init();
   MX_TIM5_Init();
   MX_USART1_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+//  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+//      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+//      HAL_TIM_Encoder_Start(&htim2,TIM_CHANNEL_ALL);
+//      HAL_TIM_Encoder_Start(&htim5,TIM_CHANNEL_ALL);
+//      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_11,1);
+//      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,1);
+//      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+//      __HAL_TIM_MOE_ENABLE(&htim1);
+//      HAL_UART_Receive_IT(&huart1, &rx_data, 1);
+//  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+//      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+//      HAL_TIM_Encoder_Start(&htim2,TIM_CHANNEL_ALL);
+//      HAL_TIM_Encoder_Start(&htim5,TIM_CHANNEL_ALL);
+//      HAL_TIM_Base_Start_IT(&htim3);
+//      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_11,1);
+//      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,1);
+//      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+//      __HAL_TIM_MOE_ENABLE(&htim1);
+//            HAL_UART_Receive_IT(&huart1, &rx_data, 1);
+  HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2);
+      HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
       HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
       HAL_TIM_Encoder_Start(&htim2,TIM_CHANNEL_ALL);
-      HAL_TIM_Encoder_Start(&htim5,TIM_CHANNEL_ALL);
       HAL_TIM_Base_Start_IT(&htim3);
       HAL_GPIO_WritePin(GPIOD, GPIO_PIN_11,1);
       HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,1);
       HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
       __HAL_TIM_MOE_ENABLE(&htim1);
-      HAL_UART_Transmit_IT(&huart1, &cmd, 1);
+      HAL_UART_Receive_IT(&huart1, &rx_data, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -259,24 +359,14 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-//	  HAL_UART_Transmit_IT(&huart1, &cmd, 1);
-//	  HAL_Delay(50);
-//	  cm=-40;
-//	  HAL_Delay(6000);
-//	  cmd=2;
-//	  HAL_UART_Transmit_IT(&huart1, &cmd, 1);
+//	  target_angle=-90;
 //	  HAL_Delay(4000);
-//	  cmd=3;
-//	  HAL_UART_Transmit_IT(&huart1, &cmd, 1);
-//	  HAL_Delay(4000);
-//	  cm=0;
-//	  HAL_Delay(6000);
-//	  cmd=4;
-//	  HAL_UART_Transmit_IT(&huart1, &cmd, 1);
-//	  HAL_Delay(4000);
-//	  cmd=1;
-//	  HAL_UART_Transmit_IT(&huart1, &cmd, 1);
-//	  HAL_Delay(4000);
+//	  target_angle=-70;
+//	  HAL_Delay(2000);
+//	  target_angle=190;
+//	  HAL_Delay(3000);
+//	  target_angle=0;
+//	  HAL_Delay(3000);
   }
   /* USER CODE END 3 */
 }
@@ -464,7 +554,7 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 83;
+  htim3.Init.Prescaler = 84-1;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim3.Init.Period = 4999;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -502,28 +592,29 @@ static void MX_TIM5_Init(void)
 
   /* USER CODE END TIM5_Init 0 */
 
-  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
   /* USER CODE BEGIN TIM5_Init 1 */
 
   /* USER CODE END TIM5_Init 1 */
   htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 0;
+  htim5.Init.Prescaler = 84-1;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 4294967295;
+  htim5.Init.Period = 20000-1;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim5, &sConfig) != HAL_OK)
+  if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim5, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim5) != HAL_OK)
   {
     Error_Handler();
   }
@@ -533,9 +624,22 @@ static void MX_TIM5_Init(void)
   {
     Error_Handler();
   }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM5_Init 2 */
 
   /* USER CODE END TIM5_Init 2 */
+  HAL_TIM_MspPostInit(&htim5);
 
 }
 
@@ -585,7 +689,6 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
@@ -596,10 +699,16 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9|GPIO_PIN_13, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PE9 PE13 */
   GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_13;
@@ -608,8 +717,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PD9 PD10 PD11 */
-  GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11;
+  /*Configure GPIO pins : PD8 PD9 PD10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
